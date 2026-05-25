@@ -138,7 +138,6 @@ KOKORO_VOICES = [
     ("bm_george",  "b"),   # British Male    — BBC-like gravitas
     ("bf_emma",    "b"),   # British Female  — warm, engaging
 ]
-TTS_SPEED = 1.08
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -244,7 +243,7 @@ def _clean_for_display(text):
 
 
 # ═══════════════════════════════════════════════════════════════
-#  VOICEOVER — Kokoro TTS (Apache 2.0)
+#  VOICEOVER — Kokoro TTS (Apache 2.0) — FIXED WITH SYNC
 # ═══════════════════════════════════════════════════════════════
 
 _kokoro_pipelines: dict = {}
@@ -258,27 +257,99 @@ def _get_kokoro_pipeline(lang_code):
 
 
 def generate_voiceover(script_lines, path):
-    full_text  = " ".join(l.strip() for l in script_lines if l.strip())
-    clean_text = _clean_for_tts(full_text)
+    """
+    Generate TTS sentence-by-sentence to:
+    ✅ Capture REAL timing for each sentence (not equal distribution)
+    ✅ Add natural pauses between sentences (0.35-0.65s based on length)
+    ✅ Slow down the hook for emphasis (0.95x speed)
+    ✅ Sound less robotic with breathing room
+    
+    Returns: (voice_name, timings_list) for caption sync
+    """
+    clean_sentences = [
+        _clean_for_tts(line.strip()) 
+        for line in script_lines 
+        if line.strip()
+    ]
+    
     voice_name, lang_code = random.choice(KOKORO_VOICES)
-    pipeline   = _get_kokoro_pipeline(lang_code)
-    audio_parts = []
-    try:
-        for _gs, _ps, chunk in pipeline(clean_text, voice=voice_name, speed=TTS_SPEED):
-            if chunk is not None and len(chunk) > 0:
-                audio_parts.append(
-                    chunk if isinstance(chunk, np.ndarray) else np.array(chunk)
-                )
-    except Exception as e:
-        raise RuntimeError(f"Kokoro TTS failed for {voice_name}: {e}")
-
-    if not audio_parts:
-        raise RuntimeError("Kokoro produced no audio — is espeak-ng installed?")
-
-    full_audio = np.concatenate(audio_parts).astype(np.float32)
+    pipeline = _get_kokoro_pipeline(lang_code)
+    
+    audio_segments = []
+    timings = []  # Actual timing: [(start, end, text), ...]
+    current_time = 0.0
+    
+    # ── OPENING SILENCE for impact ────────────────────────────
+    opening_silence = np.zeros(int(24000 * 0.25), dtype=np.float32)
+    audio_segments.append(opening_silence)
+    current_time += 0.25
+    
+    # ── Generate each sentence ────────────────────────────────
+    for i, sentence in enumerate(clean_sentences):
+        is_hook = (i == 0)
+        speed = 0.95 if is_hook else 1.0  # Hook slower for drama
+        
+        print(f"    📝 [{i+1}/{len(clean_sentences)}] {sentence[:50]}… (speed={speed})")
+        
+        # Generate TTS for this sentence only
+        sentence_audio = []
+        try:
+            for _gs, _ps, chunk in pipeline(sentence, voice=voice_name, speed=speed):
+                if chunk is not None and len(chunk) > 0:
+                    sentence_audio.append(
+                        chunk if isinstance(chunk, np.ndarray) else np.array(chunk)
+                    )
+        except Exception as e:
+            raise RuntimeError(f"Kokoro failed on sentence {i}: {e}")
+        
+        if not sentence_audio:
+            raise RuntimeError(f"No audio for: {sentence[:50]}")
+        
+        sentence_audio = np.concatenate(sentence_audio).astype(np.float32)
+        start_time = current_time
+        
+        # Add to final mix
+        audio_segments.append(sentence_audio)
+        sentence_duration = len(sentence_audio) / 24000
+        current_time += sentence_duration
+        
+        # Record ACTUAL timing (not equal distribution)
+        timings.append({
+            'index': i,
+            'text': sentence,
+            'start': start_time,
+            'end': current_time,
+            'duration': sentence_duration,
+        })
+        
+        # ── VARIABLE PAUSE ────────────────────────────────────
+        # Longer sentences = shorter pauses (user reads slower, needs less breath)
+        # Shorter sentences = longer pauses (punctuation, emphasis)
+        if i < len(clean_sentences) - 1:
+            # Base pause 0.5s, adjust by sentence length
+            pause_ms = 500 - min(200, sentence_duration * 200)
+            pause_s = max(0.35, pause_ms / 1000)
+            pause = np.zeros(int(24000 * pause_s), dtype=np.float32)
+            audio_segments.append(pause)
+            current_time += pause_s
+    
+    # ── CLOSING SILENCE ───────────────────────────────────────
+    closing_silence = np.zeros(int(24000 * 0.4), dtype=np.float32)
+    audio_segments.append(closing_silence)
+    
+    # ── COMBINE & NORMALIZE ───────────────────────────────────
+    full_audio = np.concatenate(audio_segments).astype(np.float32)
+    
+    # Prevent clipping, leave headroom for music mix
+    peak = np.max(np.abs(full_audio))
+    if peak > 1e-6:
+        full_audio = full_audio / peak * 0.92
+    
     sf.write(str(path), full_audio, samplerate=24000)
-    print(f"    ✅ Voice: {voice_name} | Apache 2.0 ✓")
-    return voice_name
+    print(f"    ✅ Generated {len(clean_sentences)} sentences | {current_time:.1f}s total")
+    print(f"    ✅ Voice: {voice_name} | Natural pacing ✓")
+    
+    return voice_name, timings
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -798,7 +869,7 @@ def _fit_to_916(clip):
 
 
 # ═══════════════════════════════════════════════════════════════
-#  VIDEO ASSEMBLY
+#  VIDEO ASSEMBLY — FIXED WITH REAL TIMING
 # ═══════════════════════════════════════════════════════════════
 
 def assemble_video(
@@ -807,11 +878,11 @@ def assemble_video(
     audio_path:   Path,
     stock_paths:  list,
     output_path:  Path,
+    timings:      list,          # ← NEW: from generate_voiceover()
     mood:         str = "dramatic",
 ):
     narration = AudioFileClip(str(audio_path))
     total_dur = narration.duration
-    sentences = script_data["script"]
     n_clips   = max(len(stock_paths), 1)
     seg_dur   = total_dur / n_clips
 
@@ -836,32 +907,17 @@ def assemble_video(
             print(f"    ⚠ Skipping clip {i}: {e}")
 
     if not bg_clips:
-        # Gradient fallback
-        bg_clips = [
-            ColorClip((WIDTH, HEIGHT), color=niche["color"])
-            .set_duration(total_dur)
-        ]
+        bg_clips = [ColorClip((WIDTH, HEIGHT), color=niche["color"]).set_duration(total_dur)]
     else:
-        bg_clips[-1] = bg_clips[-1].set_duration(
-            total_dur - seg_dur * (len(bg_clips) - 1)
-        )
+        bg_clips[-1] = bg_clips[-1].set_duration(total_dur - seg_dur * (len(bg_clips) - 1))
 
     background = concatenate_videoclips(bg_clips, method="compose").set_duration(total_dur)
 
-    # ── Film grain overlay (vintage feel) ─────────────────────
-    overlay = (
-        ColorClip((WIDTH, HEIGHT), color=(0, 0, 0))
-        .set_opacity(0.30)
-        .set_duration(total_dur)
-    )
+    # ── Film grain overlay ────────────────────────────────────
+    overlay = ColorClip((WIDTH, HEIGHT), color=(0, 0, 0)).set_opacity(0.30).set_duration(total_dur)
 
     # ── Top branding bar ──────────────────────────────────────
-    brand_bar = (
-        ColorClip((WIDTH, 130), color=(20, 20, 30))
-        .set_opacity(0.88)
-        .set_position((0, 0))
-        .set_duration(total_dur)
-    )
+    brand_bar = ColorClip((WIDTH, 130), color=(20, 20, 30)).set_opacity(0.88).set_position((0, 0)).set_duration(total_dur)
     brand_text = _text_clip(
         f"  {niche['emoji']}  {niche['label'].upper()}  ",
         duration=total_dur,
@@ -872,7 +928,7 @@ def assemble_video(
         position=("center", 30),
     )
 
-    # ── Source attribution watermark (ethical transparency) ───
+    # ── Source attribution watermark ──────────────────────────
     source_clip = _text_clip(
         "Footage: Internet Archive (Public Domain)",
         duration=total_dur,
@@ -884,40 +940,37 @@ def assemble_video(
         opacity=0.75,
     )
 
-    # ── Captions ─────────────────────────────────────────────
-    time_per_sent = total_dur / len(sentences)
+    # ── CAPTIONS WITH REAL TIMING ─────────────────────────────
+    # Use actual sentence timings from TTS, not equal distribution
     caption_clips = []
-    cap_bg_colors = [
-        (0, 0, 0, 160), (20, 0, 40, 160), (0, 20, 40, 160)
-    ]
+    cap_bg_colors = [(0, 0, 0, 160), (20, 0, 40, 160), (0, 20, 40, 160)]
 
-    for i, sentence in enumerate(sentences):
-        display = _clean_for_display(sentence)
-        is_hook = i == 0
-        size    = 74 if is_hook else 64
-        color   = (255, 255, 0) if is_hook else (255, 255, 255)
-        base_y  = HEIGHT // 2 - 140
-
+    for timing in timings:
+        i = timing['index']
+        display = timing['text']  # Already clean from TTS
+        is_hook = (i == 0)
+        size = 74 if is_hook else 64
+        color = (255, 255, 0) if is_hook else (255, 255, 255)
+        
+        # Use ACTUAL sentence timing
+        start = timing['start']
+        duration = timing['end'] - timing['start']
+        
         cap = _text_clip(
             display,
-            duration=time_per_sent,
+            duration=duration,
             font_size=size,
             text_color=color,
             stroke_color=(0, 0, 0),
             stroke_width=5 if is_hook else 4,
-            position=("center", base_y),
-            start=i * time_per_sent,
+            position=("center", HEIGHT // 2 - 140),
+            start=start,  # ← Real timing
         )
-        cap = cap.fx(vfx.fadein, 0.10).fx(vfx.fadeout, 0.10)
+        cap = cap.fx(vfx.fadein, 0.08).fx(vfx.fadeout, 0.08)
         caption_clips.append(cap)
 
     # ── Bottom CTA bar ────────────────────────────────────────
-    cta_bar = (
-        ColorClip((WIDTH, 160), color=(180, 0, 30))
-        .set_opacity(0.92)
-        .set_position((0, HEIGHT - 160))
-        .set_duration(total_dur)
-    )
+    cta_bar = ColorClip((WIDTH, 160), color=(180, 0, 30)).set_opacity(0.92).set_position((0, HEIGHT - 160)).set_duration(total_dur)
     cta_clip = _text_clip(
         "👆 FOLLOW for daily shocking truths!",
         duration=total_dur,
@@ -938,7 +991,7 @@ def assemble_video(
 
     # ── Audio mix ─────────────────────────────────────────────
     print(f"    🎵 Generating procedural {mood} score…")
-    bg_music  = generate_background_music(total_dur, mood=mood)
+    bg_music = generate_background_music(total_dur, mood=mood)
     audio_mix = CompositeAudioClip([
         narration.volumex(1.0),
         bg_music.volumex(0.28),
@@ -1043,7 +1096,7 @@ def upload_to_youtube(video_path: Path, script_data: dict, niche: dict) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════
-#  MAIN PIPELINE
+#  MAIN PIPELINE — UPDATED
 # ═══════════════════════════════════════════════════════════════
 
 NICHE_MOOD_MAP = {
@@ -1071,7 +1124,7 @@ def run_pipeline(upload: bool = True, niche_override: str = None):
     print(f"🎬  Shorts Pipeline — {ts}")
     print(f"    Niche  : {niche['emoji']} {niche['label']}")
     print(f"    Music  : {mood}")
-    print(f"    TTS    : Kokoro Apache 2.0 ✓")
+    print(f"    TTS    : Kokoro Apache 2.0 (Natural Pacing) ✓")
     print(f"    Footage: Internet Archive PD ✓")
     print(f"{'═'*62}")
 
@@ -1082,9 +1135,9 @@ def run_pipeline(upload: bool = True, niche_override: str = None):
         print(f"    Topic  : {data['topic']}")
         print(f"    Hook   : {data['hook'][:70]}…")
 
-        print("\n🎙   Voiceover (Kokoro TTS)…")
-        voice = generate_voiceover(data["script"], audio_path)
-        print(f"    Saved  : {audio_path} | Voice: {voice}")
+        print("\n🎙   Voiceover (Kokoro TTS — sentence by sentence)…")
+        voice, timings = generate_voiceover(data["script"], audio_path)  # ← Now returns timings
+        print(f"    Saved  : {audio_path}")
 
         print("\n📚  Fetching public domain footage (Internet Archive)…")
         print(f"    Search terms: {data['archive_search_terms']}")
@@ -1096,7 +1149,7 @@ def run_pipeline(upload: bool = True, niche_override: str = None):
         print(f"    Got {len(clips)} clips")
 
         print("\n🎞   Assembling video…")
-        assemble_video(data, niche, audio_path, clips, video_path, mood=mood)
+        assemble_video(data, niche, audio_path, clips, video_path, timings=timings, mood=mood)  # ← Pass timings
         print(f"    Saved  : {video_path}")
 
         vid_id = None
@@ -1115,11 +1168,11 @@ def run_pipeline(upload: bool = True, niche_override: str = None):
         })
         UPLOAD_LOG.write_text(json.dumps(logs, indent=2))
 
-        # Cleanup transient files (keep cached archive clips)
         audio_path.unlink(missing_ok=True)
 
         print(f"\n🎉  Done! → {video_path.name}")
         print(f"    Legal: PD footage ✓ | Original music ✓ | Apache TTS ✓")
+        print(f"    Sync: Per-sentence timing ✓ | Natural pacing ✓")
         return vid_id
 
     except Exception as e:
