@@ -424,6 +424,84 @@ archive_search_terms: choose terms that will find GENERIC PUBLIC DOMAIN footage
 
 
 # ═══════════════════════════════════════════════════════════════
+#  SCRIPT GENERATION — IMPROVED (with scene breakdown)
+# ═══════════════════════════════════════════════════════════════
+
+def generate_script_IMPROVED(niche: dict) -> dict:
+    """
+    Enhanced script generation that creates:
+    1. Engaging narration (same as before)
+    2. CONTEXTUAL search terms that match the story
+    3. Scene breakdown for multi-clip sequencing
+    """
+    used      = json.loads(TOPICS_LOG.read_text()) if TOPICS_LOG.exists() else []
+    avoid_str = ", ".join(used[-40:]) if used else "none"
+
+    prompt = f"""You are a viral YouTube Shorts scriptwriter.
+Niche: {niche['prompt']}
+
+Write an EXTREMELY ENGAGING YouTube Short script.
+
+RULES:
+1. Exactly 8–10 short, punchy sentences.
+2. FIRST sentence = shocking hook.
+3. Every sentence under 15 words.
+4. Include specific names, numbers, dates.
+5. Build tension — each sentence drives to the next.
+6. Last sentence: "Follow for more shocking truths!"
+7. Avoid: {avoid_str}
+
+CRITICAL: Generate search terms that MATCH YOUR STORY CONTENT:
+- If you mention a FOOD BRAND → search "food factory", "manufacturing", "workers packaging"
+- If you mention a BUSINESSMAN → search "vintage office", "business meeting", "typewriter desk"
+- If you mention a DISASTER → search "disaster relief", "aftermath", "emergency response"
+- If you mention SPACE/SCIENCE → search "space exploration", "laboratory", "scientific equipment"
+
+You CAN be specific about INDUSTRY/ACTIVITY (not copyrighted), just avoid proper names.
+
+Return ONLY valid JSON:
+{{
+  "title": "catchy title with emoji, max 60 chars",
+  "topic": "3-word slug for deduplication",
+  "hook": "sentence 1 exactly",
+  "script": ["sentence1", "sentence2", ...],
+  "archive_search_terms": ["term1 describing main theme", "term2 describing action/setting", "term3 visual style"],
+  "scene_breakdown": [
+    {{"sentence_indices": [0, 1], "visual_theme": "establishing shot", "search_override": "factory floor workers industrial"}},
+    {{"sentence_indices": [2, 3], "visual_theme": "growth/success montage", "search_override": "business growth expansion"}},
+    {{"sentence_indices": [4, 5], "visual_theme": "climax/turning point", "search_override": "challenge obstacle struggle"}},
+    {{"sentence_indices": [6, 7], "visual_theme": "triumph/legacy", "search_override": "success celebration achievement"}}
+  ],
+  "description": "compelling YT description, max 200 chars",
+  "tags": ["tag1","tag2","tag3","tag4","tag5","tag6"]
+}}"""
+
+    resp = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={"Authorization": f"Bearer {GROQ_API_KEY}",
+                 "Content-Type": "application/json"},
+        json={
+            "model": "llama-3.3-70b-versatile",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.90,
+            "max_tokens": 1200,
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+
+    raw = resp.json()["choices"][0]["message"]["content"].strip()
+    if raw.startswith("```"):
+        raw = raw.split("```", 1)[1].lstrip("json").strip()
+    raw = raw.rstrip("```").strip()
+
+    data = json.loads(raw)
+    used.append(data["topic"])
+    TOPICS_LOG.write_text(json.dumps(used[-200:], indent=2))
+    return data
+
+
+# ═══════════════════════════════════════════════════════════════
 #  INTERNET ARCHIVE FETCHER — Public Domain Only
 # ═══════════════════════════════════════════════════════════════
 #
@@ -663,6 +741,112 @@ def fetch_archive_clips(
 
 
 # ═══════════════════════════════════════════════════════════════
+#  ARCHIVE FETCHER — IMPROVED (with scene-aware & aspect ratio check)
+# ═══════════════════════════════════════════════════════════════
+
+def fetch_archive_clips_IMPROVED(
+    script_data: dict,
+    topic_slug: str,
+    target_count: int = 6,
+) -> list:
+    """
+    Uses scene_breakdown to fetch CONTEXTUAL clips.
+    If scene_breakdown is missing, falls back to generic search.
+    Checks aspect ratio before accepting clips.
+    """
+    scene_breakdown = script_data.get("scene_breakdown", [])
+    search_terms = script_data.get("archive_search_terms", [])
+    
+    found_identifiers = []
+    
+    # ── PRIMARY: Use scene-specific search terms ───────────────
+    if scene_breakdown:
+        for scene in scene_breakdown:
+            search_term = scene.get("search_override", "")
+            if not search_term:
+                continue
+            
+            for collection in ARCHIVE_SAFE_COLLECTIONS[:3]:
+                if len(found_identifiers) >= target_count * 2:
+                    break
+                docs = _search_archive(search_term, collection, max_results=5)
+                for doc in docs:
+                    identifier = doc.get("identifier", "")
+                    if identifier:
+                        found_identifiers.append(identifier)
+            
+            time.sleep(0.3)  # be polite to Archive.org
+    
+    # ── FALLBACK: Use generic search terms ─────────────────────
+    if len(found_identifiers) < target_count:
+        for term in search_terms[:4]:
+            for collection in ARCHIVE_SAFE_COLLECTIONS.copy():
+                if len(found_identifiers) >= target_count * 2:
+                    break
+                docs = _search_archive(term, collection, max_results=4)
+                for doc in docs:
+                    identifier = doc.get("identifier", "")
+                    if identifier:
+                        found_identifiers.append(identifier)
+            time.sleep(0.3)
+    
+    # Deduplicate
+    seen = set()
+    unique_ids = []
+    for ident in found_identifiers:
+        if ident not in seen:
+            seen.add(ident)
+            unique_ids.append(ident)
+    
+    print(f"    📚 Found {len(unique_ids)} contextual candidates")
+    
+    local_paths = []
+    for identifier in unique_ids[:target_count * 3]:
+        if len(local_paths) >= target_count:
+            break
+        
+        cache_name = f"archive_{hashlib.md5(identifier.encode()).hexdigest()[:12]}.mp4"
+        cache_path = CACHE_DIR / cache_name
+        
+        if cache_path.exists() and cache_path.stat().st_size > 50_000:
+            local_paths.append(str(cache_path))
+            print(f"    💾 Cache: {identifier}")
+            continue
+        
+        url = _get_video_url(identifier)
+        if not url:
+            continue
+        
+        print(f"    ⬇ Downloading: {identifier}")
+        if _download_clip(url, cache_path):
+            try:
+                test = VideoFileClip(str(cache_path), audio=False)
+                dur = test.duration
+                # ✅ NEW: Check aspect ratio BEFORE adding
+                w, h = test.size
+                aspect = w / h if h > 0 else 16/9
+                test.close()
+                
+                # Accept videos that are close to 16:9 or 9:16
+                if dur > 1.5 and (0.5 < aspect < 2.0):  # Reasonable range
+                    local_paths.append(str(cache_path))
+                    print(f"    ✅ {identifier} ({dur:.1f}s, {aspect:.2f}:1)")
+                else:
+                    print(f"    ⚠ Aspect ratio {aspect:.2f}:1 too extreme")
+                    cache_path.unlink(missing_ok=True)
+            except Exception as e:
+                print(f"    ⚠ Invalid video: {identifier}")
+                cache_path.unlink(missing_ok=True)
+        
+        time.sleep(0.5)
+    
+    if not local_paths:
+        print("    ⚠ No clips found — will use colored fallback")
+    
+    return local_paths
+
+
+# ═══════════════════════════════════════════════════════════════
 #  PROCEDURAL CINEMATIC MUSIC (100% original, no samples)
 # ═══════════════════════════════════════════════════════════════
 
@@ -869,6 +1053,66 @@ def _fit_to_916(clip):
 
 
 # ═══════════════════════════════════════════════════════════════
+#  VIDEO FITTING — IMPROVED (Preserve Aspect, Use Letterbox)
+# ═══════════════════════════════════════════════════════════════
+
+def _fit_to_916_IMPROVED(clip):
+    """
+    Fit video to 9:16 (mobile portrait) intelligently:
+    
+    - If video is already portrait-ish → minimal crop
+    - If video is wide (16:9) → add BLACK BARS top/bottom (not aggressive crop)
+    - Prevents distortion while keeping content visible
+    """
+    cw, ch = clip.size
+    target_ratio = WIDTH / HEIGHT  # 1080/1920 = 0.5625 (9:16 portrait)
+    current_ratio = cw / ch
+    
+    print(f"    🎬 Fitting video: {cw}x{ch} (ratio: {current_ratio:.2f}) → 9:16")
+    
+    if current_ratio < 0.4:
+        # Already very portrait — just resize
+        return clip.resize((WIDTH, HEIGHT))
+    
+    elif 0.4 <= current_ratio <= 0.7:
+        # Portrait-ish (like 3:4 or 1:2) — safe to use with minimal crop
+        clip = clip.resize((WIDTH, int(WIDTH / current_ratio)))
+        if clip.h > HEIGHT:
+            # Slight crop from top/bottom
+            excess = clip.h - HEIGHT
+            clip = crop(clip, width=WIDTH, height=HEIGHT, 
+                       y_center=clip.h // 2)
+        return clip.resize((WIDTH, HEIGHT))
+    
+    else:
+        # Landscape or wide (current_ratio > 0.7)
+        # Add BLACK BARS instead of aggressive cropping
+        
+        # Scale to fit width
+        scaled = clip.resize(width=WIDTH)
+        
+        if scaled.h >= HEIGHT:
+            # Still too tall — center crop
+            excess = scaled.h - HEIGHT
+            scaled = crop(scaled, width=WIDTH, height=HEIGHT,
+                         y_center=scaled.h // 2)
+            return scaled.resize((WIDTH, HEIGHT))
+        else:
+            # Too short — letterbox with black bars
+            black_bar_height = HEIGHT - scaled.h
+            top_bar = ColorClip((WIDTH, black_bar_height // 2), (0, 0, 0)).set_duration(scaled.duration)
+            bottom_bar = ColorClip((WIDTH, black_bar_height // 2 + black_bar_height % 2), (0, 0, 0)).set_duration(scaled.duration)
+            
+            final = concatenate_videoclips(
+                [top_bar, scaled, bottom_bar],
+                method="chain"
+            ).set_duration(scaled.duration)
+            
+            print(f"    ✅ Added letterbox bars (preserved content)")
+            return final
+
+
+# ═══════════════════════════════════════════════════════════════
 #  VIDEO ASSEMBLY — FIXED WITH REAL TIMING
 # ═══════════════════════════════════════════════════════════════
 
@@ -891,7 +1135,7 @@ def assemble_video(
     for i, sp in enumerate(stock_paths):
         try:
             vc = VideoFileClip(sp, audio=False)
-            vc = _fit_to_916(vc)
+            vc = _fit_to_916_IMPROVED(vc)  # ← Using improved version
             vc = _motionize_clip(
                 vc, seg_dur,
                 seed=hash((script_data["topic"], i)) & 0xFFFFFFFF,
@@ -1129,8 +1373,8 @@ def run_pipeline(upload: bool = True, niche_override: str = None):
     print(f"{'═'*62}")
 
     try:
-        print("\n📝  Generating script…")
-        data = generate_script(niche)
+        print("\n📝  Generating script (with contextual search terms)…")
+        data = generate_script_IMPROVED(niche)  # ← Using improved version
         print(f"    Title  : {data['title']}")
         print(f"    Topic  : {data['topic']}")
         print(f"    Hook   : {data['hook'][:70]}…")
@@ -1139,10 +1383,10 @@ def run_pipeline(upload: bool = True, niche_override: str = None):
         voice, timings = generate_voiceover(data["script"], audio_path)  # ← Now returns timings
         print(f"    Saved  : {audio_path}")
 
-        print("\n📚  Fetching public domain footage (Internet Archive)…")
+        print("\n📚  Fetching contextual footage (with aspect ratio check)…")
         print(f"    Search terms: {data['archive_search_terms']}")
-        clips = fetch_archive_clips(
-            data["archive_search_terms"],
+        clips = fetch_archive_clips_IMPROVED(  # ← Using improved version
+            data,
             data["topic"],
             target_count=6,
         )
