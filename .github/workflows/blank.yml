@@ -37,6 +37,7 @@ jobs:
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
         run: python pipeline.py
       - name: Upload shorts as artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: shorts-${{ github.run_id }}
